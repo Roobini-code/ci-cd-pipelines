@@ -3,6 +3,10 @@
 This repository contains GitHub Actions reusable workflows that application
 repositories can call instead of duplicating pipeline code.
 
+For a step-by-step AWS infrastructure, IAM/OIDC, Systems Manager, GitHub
+repository configuration, and deployment walkthrough, see
+[`doc/TASKBOARD-AWS-GITHUB-ACTIONS-INFRASTRUCTURE.md`](doc/TASKBOARD-AWS-GITHUB-ACTIONS-INFRASTRUCTURE.md).
+
 ## Taskboard Java
 
 `/.github/workflows/taskboard-java.yml` is called by
