@@ -2,16 +2,26 @@ name: Taskboard Java CI/CD
 
 on:
   workflow_call:
+    inputs:
+      aws_region:
+        description: AWS Region containing the Taskboard EC2 instance
+        required: false
+        default: ""
+        type: string
+      ec2_instance_id:
+        description: EC2 instance ID to deploy to through Systems Manager
+        required: false
+        default: ""
+        type: string
+      aws_role_arn:
+        description: IAM role assumed by GitHub Actions through OIDC
+        required: false
+        default: ""
+        type: string
     secrets:
       DOCKERHUB_USERNAME:
         required: false
       DOCKERHUB_TOKEN:
-        required: false
-      EC2_HOST:
-        required: false
-      EC2_SSH_PRIVATE_KEY:
-        required: false
-      EC2_KNOWN_HOSTS:
         required: false
 
 permissions:
@@ -47,11 +57,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Check out application
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate deployment inputs
+        shell: bash
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          EC2_INSTANCE_ID: ${{ inputs.ec2_instance_id }}
+          AWS_ROLE_ARN: ${{ inputs.aws_role_arn }}
+        run: |
+          for name in AWS_REGION EC2_INSTANCE_ID AWS_ROLE_ARN; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Required workflow input $name is not configured"
+              exit 1
+            fi
+          done
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
@@ -91,35 +116,36 @@ jobs:
             roobinidevops/taskboard-java:${{ steps.release.outputs.image_tag }}
             roobinidevops/taskboard-java:latest
 
-      - name: Deploy image to EC2
+      - name: Configure AWS credentials with GitHub OIDC
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Deploy image to EC2 through Systems Manager
         shell: bash
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          EC2_INSTANCE_ID: ${{ inputs.ec2_instance_id }}
           IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
         run: |
-          for name in EC2_HOST EC2_SSH_PRIVATE_KEY EC2_KNOWN_HOSTS; do
+          for name in EC2_INSTANCE_ID IMAGE_TAG; do
             if [[ -z "${!name}" ]]; then
-              echo "::error::Required Actions secret $name is not configured"
+              echo "::error::Required workflow input $name is not configured"
               exit 1
             fi
           done
 
-          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ec2_key"
-          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
-          chmod 600 "$RUNNER_TEMP/ec2_key" "$RUNNER_TEMP/known_hosts"
+          if [[ ! "$IMAGE_TAG" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "::error::Invalid Docker image tag: $IMAGE_TAG"
+            exit 1
+          fi
 
-          ssh \
-            -i "$RUNNER_TEMP/ec2_key" \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$RUNNER_TEMP/known_hosts" \
-            "ec2-user@$EC2_HOST" \
-            "bash -s -- '$IMAGE_TAG'" <<'REMOTE_SCRIPT'
-          set -euo pipefail
-          image_tag="$1"
-          image="roobinidevops/taskboard-java:${image_tag}"
+          {
+            printf "IMAGE_TAG='%s'\n" "$IMAGE_TAG"
+            cat <<'REMOTE_SCRIPT'
+          set -eu
+          image="roobinidevops/taskboard-java:${IMAGE_TAG}"
           previous_image=""
 
           sudo docker pull "$image"
@@ -141,29 +167,72 @@ jobs:
           }
 
           if ! run_taskboard "$image"; then
-            if [[ -n "$previous_image" ]]; then
+            if sudo docker container inspect taskboard >/dev/null 2>&1; then
+              sudo docker rm -f taskboard
+            fi
+            if [ -n "$previous_image" ]; then
               echo "New container failed to start; restoring $previous_image" >&2
               run_taskboard "$previous_image"
             fi
             exit 1
           fi
 
-          for attempt in {1..30}; do
+          attempt=1
+          while [ "$attempt" -le 30 ]; do
             if curl --fail --silent --output /dev/null http://127.0.0.1/; then
               exit 0
             fi
             sleep 2
+            attempt=$((attempt + 1))
           done
 
           sudo docker logs --tail=100 taskboard >&2
           sudo docker rm -f taskboard
-          if [[ -n "$previous_image" ]]; then
+          if [ -n "$previous_image" ]; then
             echo "New container failed its health check; restoring $previous_image" >&2
             run_taskboard "$previous_image"
           fi
           echo "Taskboard did not become healthy after deployment" >&2
           exit 1
           REMOTE_SCRIPT
+          } > "$RUNNER_TEMP/deploy-taskboard.sh"
+
+          parameters="$(jq -n --rawfile script "$RUNNER_TEMP/deploy-taskboard.sh" '{commands: [$script]}')"
+          command_id="$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy Taskboard image ${IMAGE_TAG}" \
+            --parameters "$parameters" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          for attempt in {1..60}; do
+            if invocation="$(aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --output json 2>&1)"; then
+              status="$(jq -r '.Status' <<< "$invocation")"
+              case "$status" in
+                Success)
+                  jq -r '.StandardOutputContent' <<< "$invocation"
+                  exit 0
+                  ;;
+                Failed|TimedOut|Cancelled|Cancelling)
+                  jq -r '.StandardOutputContent, .StandardErrorContent' <<< "$invocation" >&2
+                  echo "::error::SSM deployment command ended with status $status"
+                  exit 1
+                  ;;
+              esac
+            elif [[ "$invocation" != *InvocationDoesNotExist* ]]; then
+              echo "$invocation" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          aws ssm cancel-command --command-id "$command_id" >/dev/null
+          echo "::error::Timed out waiting for the SSM deployment command"
+          exit 1
 
       - name: Create and push Git tag
         shell: bash
