@@ -170,6 +170,97 @@ outbound HTTPS connection, and the Systems Manager service relays the command.
 The user's browser reaches the app separately on EC2 port 80, subject to the
 HTTP security-group rule.
 
+### 2.3 AWS-service map: what is created in each service?
+
+This view groups resources under the AWS service where you configure or see
+them. Text inside each box explains what the item is for. Arrows show runtime
+calls; dotted lines show permissions or attachments, not network connections.
+
+```mermaid
+flowchart TB
+  subgraph GITHUB["GitHub"]
+    APP["java-project workflow<br/>Starts on pull request or push to main"]
+    RUNNER["GitHub-hosted runner<br/>Runs tests; on main, builds and publishes image"]
+    OIDC["GitHub OIDC token<br/>Identifies repository and branch to AWS"]
+    APP -->|"calls reusable workflow"| RUNNER
+    RUNNER -->|"requests token"| OIDC
+  end
+
+  subgraph HUB["Docker Hub"]
+    IMAGE["roobinidevops/taskboard-java<br/>Stores versioned and latest images"]
+  end
+
+  subgraph AWS["AWS account"]
+    subgraph IAM["IAM - identity, trust, and permissions"]
+      PROVIDER["OIDC identity provider<br/>Registers GitHub as a trusted token issuer"]
+      GHROLE["TaskboardGitHubActionsDeployRole<br/>Temporary role the runner assumes"]
+      TRUST["Role trust policy<br/>Only java-project on main may assume this role"]
+      DEPLOYPOLICY["TaskboardGitHubDeployPolicy<br/>Allows SSM deployment commands for the target instance"]
+      EC2ROLE["TaskboardEC2SSMRole<br/>Role attached to EC2; has AmazonSSMManagedInstanceCore attached"]
+      PROFILE["EC2 instance profile<br/>Makes the EC2 role available to the instance"]
+      TRUST -. "controls who may assume" .-> GHROLE
+      DEPLOYPOLICY -. "grants actions to" .-> GHROLE
+      EC2ROLE -. "is carried by" .-> PROFILE
+    end
+
+    subgraph STS["AWS STS - Security Token Service"]
+      CREDENTIALS["Temporary AWS credentials<br/>Issued after OIDC and trust checks pass"]
+    end
+
+    subgraph SSM["Systems Manager (SSM)"]
+      COMMAND["Run Command<br/>AWS-RunShellScript runs the deployment script"]
+      NODE["Managed node entry<br/>Appears when the SSM agent registers and checks in"]
+    end
+
+    subgraph EC2["EC2"]
+      INSTANCE["taskboard-ec2<br/>Amazon Linux 2023 virtual server"]
+      SOFTWARE["Installed on the host<br/>Docker Engine and curl<br/>SSM agent enabled and running"]
+      CONTAINER["Taskboard Docker container<br/>Listens on host port 80; container port 8080"]
+      VOLUME["taskboard-data Docker volume<br/>Keeps H2 database data when container is replaced"]
+      FIREWALL["Security group<br/>Inbound HTTP 80 for intended users<br/>Outbound HTTPS 443 for AWS and Docker Hub"]
+      INSTANCE --> SOFTWARE
+      SOFTWARE --> CONTAINER
+      CONTAINER --> VOLUME
+      FIREWALL -. "filters instance network traffic" .-> INSTANCE
+      PROFILE -. "provides EC2 role credentials" .-> INSTANCE
+    end
+  end
+
+  OIDC -->|"token over HTTPS"| CREDENTIALS
+  PROVIDER -. "issuer AWS validates" .-> CREDENTIALS
+  GHROLE -. "trust checked before assumption" .-> CREDENTIALS
+  CREDENTIALS -->|"runner calls SSM API over HTTPS 443"| COMMAND
+  DEPLOYPOLICY -. "authorizes SendCommand and status reads" .-> COMMAND
+  SOFTWARE -->|"agent registers and polls outbound over HTTPS 443"| NODE
+  NODE -->|"SSM relays command to the agent"| SOFTWARE
+  RUNNER -->|"pushes images over HTTPS 443"| IMAGE
+  SOFTWARE -->|"Docker pulls versioned image over HTTPS 443"| IMAGE
+```
+
+**Where the SSM managed node comes from:** you do not create a managed node
+manually. Amazon Linux 2023 normally includes the SSM agent. Once
+`TaskboardEC2SSMRole` is attached to the instance and the agent is running, the
+agent uses that role to register with Systems Manager over outbound HTTPS.
+The instance then appears under **Systems Manager → Fleet Manager** or
+**Managed nodes** in the same Region, usually as **Online**. If the agent is
+not running, the role is missing, or outbound access is blocked, the instance
+will not appear online.
+
+**What is installed on EC2:** Docker Engine runs the Taskboard container, and
+`curl` is used for the local HTTP health check after deployment. The SSM agent
+receives and reports deployment commands. Java is packaged in the application
+image; it does not need to be installed separately on the EC2 host. The
+workflow uses the host's `taskboard-data` Docker volume to preserve the H2
+database when it replaces the container.
+
+**What the runner calls:** after tests pass on a push to `main`, the runner
+pushes the Docker image to Docker Hub, requests a GitHub OIDC token, and
+exchanges it with AWS STS for temporary credentials. It then calls the SSM
+`SendCommand` API and polls for the command result. It does not call EC2 over
+SSH. The SSM agent initiates its own outbound connection to Systems Manager,
+receives the command, pulls the image from Docker Hub, and runs the deployment
+script on the EC2 host.
+
 ## 3. AWS prerequisites
 
 ### 3.1 Account, Region, and cost
