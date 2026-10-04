@@ -73,21 +73,21 @@ connection.
 
 ```mermaid
 flowchart TB
-  APP["1. App workflow<br/>Roobini-code/java-project<br/>main branch"]
-  REUSABLE["2. Reusable workflow<br/>ci-cd-pipelines"]
-  RUNNER["3. GitHub-hosted runner"]
-  ISSUER["4. GitHub OIDC issuer<br/>token.actions.githubusercontent.com"]
-  TOKEN["5. Signed OIDC token<br/>sub = repo:Roobini-code/java-project:ref:refs/heads/main<br/>aud = sts.amazonaws.com"]
-  PROVIDER["6. AWS IAM OIDC provider<br/>registers GitHub as token issuer"]
-  TRUST["7. Role trust policy<br/>allows only this repo and main"]
-  ROLE["8. TaskboardGitHubActionsDeployRole"]
-  POLICY["9. TaskboardGitHubDeployPolicy<br/>SSM command access limited to target EC2"]
-  STS["10. AWS STS<br/>validates token and issues temporary credentials"]
-  SSM["11. AWS Systems Manager"]
-  EC2ROLE["12. TaskboardEC2SSMRole<br/>AmazonSSMManagedInstanceCore"]
-  INSTANCE["13. EC2 instance profile + taskboard-ec2"]
-  AGENT["14. SSM agent on EC2"]
-  APP_CONTAINER["15. Taskboard container<br/>taskboard-data Docker volume"]
+  APP["1. GitHub Actions workflow<br/>Roobini-code/java-project<br/>main branch"]
+  REUSABLE["2. GitHub Actions reusable workflow<br/>ci-cd-pipelines"]
+  RUNNER["3. GitHub-hosted Actions runner"]
+  ISSUER["4. GitHub Actions OIDC issuer<br/>token.actions.githubusercontent.com"]
+  TOKEN["5. GitHub OIDC signed token<br/>sub = repo:Roobini-code/java-project:ref:refs/heads/main<br/>aud = sts.amazonaws.com"]
+  PROVIDER["6. AWS IAM identity provider (OIDC)<br/>registers GitHub as token issuer"]
+  TRUST["7. AWS IAM role trust policy<br/>allows only this repo and main"]
+  ROLE["8. AWS IAM role<br/>TaskboardGitHubActionsDeployRole"]
+  POLICY["9. AWS IAM permissions policy<br/>TaskboardGitHubDeployPolicy<br/>SSM command access limited to target EC2"]
+  STS["10. AWS Security Token Service (STS)<br/>validates token and issues temporary credentials"]
+  SSM["11. AWS Systems Manager (SSM)<br/>Run Command service"]
+  EC2ROLE["12. AWS IAM EC2 instance role<br/>TaskboardEC2SSMRole<br/>AmazonSSMManagedInstanceCore policy"]
+  INSTANCE["13. EC2 instance profile and EC2 instance<br/>taskboard-ec2"]
+  AGENT["14. AWS Systems Manager Agent (SSM Agent)<br/>software running on EC2"]
+  APP_CONTAINER["15. Docker container on EC2<br/>Taskboard app + taskboard-data Docker volume"]
 
   APP -->|"calls"| REUSABLE
   REUSABLE -->|"starts job on"| RUNNER
@@ -173,69 +173,86 @@ HTTP security-group rule.
 ### 2.3 AWS-service map: what is created in each service?
 
 This view groups resources under the AWS service where you configure or see
-them. Text inside each box explains what the item is for. Arrows show runtime
-calls; dotted lines show permissions or attachments, not network connections.
+them. Each resource box names its service (for example, **IAM role** or
+**SSM Run Command**) and its purpose. Numbered solid arrows show the order of
+runtime deployment actions. Dotted lines show permissions or attachments,
+not network connections. IAM and network resources are created during setup;
+they support the numbered flow but are not runtime steps themselves.
 
 ```mermaid
 flowchart TB
   subgraph GITHUB["GitHub"]
-    APP["java-project workflow<br/>Starts on pull request or push to main"]
-    RUNNER["GitHub-hosted runner<br/>Runs tests; on main, builds and publishes image"]
-    OIDC["GitHub OIDC token<br/>Identifies repository and branch to AWS"]
-    APP -->|"calls reusable workflow"| RUNNER
-    RUNNER -->|"requests token"| OIDC
+    APP["GitHub Actions workflow<br/>java-project caller invokes reusable workflow"]
+    RUNNER["GitHub Actions runner<br/>Runs tests and deployment job"]
+    TEST["GitHub Actions verification job<br/>mvn clean verify and Docker build"]
+    OIDC["GitHub OIDC token<br/>Identifies java-project on main"]
+    APP -->|"1. starts job"| RUNNER
+    RUNNER -->|"2. runs"| TEST
+    RUNNER -->|"4. requests token"| OIDC
   end
 
   subgraph HUB["Docker Hub"]
-    IMAGE["roobinidevops/taskboard-java<br/>Stores versioned and latest images"]
+    IMAGE["Docker Hub repository<br/>roobinidevops/taskboard-java<br/>Stores versioned and latest images"]
   end
 
   subgraph AWS["AWS account"]
-    subgraph IAM["IAM - identity, trust, and permissions"]
-      PROVIDER["OIDC identity provider<br/>Registers GitHub as a trusted token issuer"]
-      GHROLE["TaskboardGitHubActionsDeployRole<br/>Temporary role the runner assumes"]
-      TRUST["Role trust policy<br/>Only java-project on main may assume this role"]
-      DEPLOYPOLICY["TaskboardGitHubDeployPolicy<br/>Allows SSM deployment commands for the target instance"]
-      EC2ROLE["TaskboardEC2SSMRole<br/>Role attached to EC2; has AmazonSSMManagedInstanceCore attached"]
-      PROFILE["EC2 instance profile<br/>Makes the EC2 role available to the instance"]
+    subgraph IAM["AWS IAM - roles, policies, and identity provider"]
+      PROVIDER["IAM OIDC identity provider<br/>Registers GitHub as a trusted token issuer"]
+      GHROLE["IAM role: TaskboardGitHubActionsDeployRole<br/>Assumed temporarily by the GitHub runner"]
+      TRUST["IAM role trust policy<br/>Only java-project on main may assume this role"]
+      DEPLOYPOLICY["IAM permissions policy: TaskboardGitHubDeployPolicy<br/>Allows SSM deployment commands for the target instance"]
+      EC2ROLE["IAM role: TaskboardEC2SSMRole<br/>EC2 role with AmazonSSMManagedInstanceCore attached"]
+      PROFILE["IAM instance profile<br/>Makes the EC2 role available to the instance"]
       TRUST -. "controls who may assume" .-> GHROLE
       DEPLOYPOLICY -. "grants actions to" .-> GHROLE
       EC2ROLE -. "is carried by" .-> PROFILE
     end
 
     subgraph STS["AWS STS - Security Token Service"]
-      CREDENTIALS["Temporary AWS credentials<br/>Issued after OIDC and trust checks pass"]
+      CREDENTIALS["STS temporary credentials<br/>Issued after OIDC identity and role trust checks pass"]
     end
 
     subgraph SSM["Systems Manager (SSM)"]
-      COMMAND["Run Command<br/>AWS-RunShellScript runs the deployment script"]
-      NODE["Managed node entry<br/>Appears when the SSM agent registers and checks in"]
+      COMMAND["SSM Run Command<br/>AWS-RunShellScript executes the deployment script"]
+      NODE["SSM managed node<br/>EC2 appears here after its SSM agent registers"]
     end
 
-    subgraph EC2["EC2"]
-      INSTANCE["taskboard-ec2<br/>Amazon Linux 2023 virtual server"]
-      SOFTWARE["Installed on the host<br/>Docker Engine and curl<br/>SSM agent enabled and running"]
-      CONTAINER["Taskboard Docker container<br/>Listens on host port 80; container port 8080"]
-      VOLUME["taskboard-data Docker volume<br/>Keeps H2 database data when container is replaced"]
-      FIREWALL["Security group<br/>Inbound HTTP 80 for intended users<br/>Outbound HTTPS 443 for AWS and Docker Hub"]
+    subgraph EC2["AWS EC2 - virtual server and application runtime"]
+      INSTANCE["EC2 instance: taskboard-ec2<br/>Amazon Linux 2023 virtual server"]
+      SOFTWARE["EC2 host software<br/>Docker Engine runs containers; curl checks app health<br/>SSM agent receives and reports deployment commands"]
+      CONTAINER["Docker container on EC2<br/>Taskboard listens on host port 80; container port 8080"]
+      VOLUME["Docker named volume on EC2 disk<br/>taskboard-data preserves the H2 database"]
+      HEALTH["EC2 deployment health check<br/>curl requests http://127.0.0.1:80"]
+      FIREWALL["EC2/VPC security group<br/>Inbound HTTP 80 for intended users<br/>Outbound HTTPS 443 to AWS and Docker Hub"]
       INSTANCE --> SOFTWARE
-      SOFTWARE --> CONTAINER
-      CONTAINER --> VOLUME
+      SOFTWARE -->|"9. starts/replaces"| CONTAINER
+      CONTAINER -->|"stores database in"| VOLUME
       FIREWALL -. "filters instance network traffic" .-> INSTANCE
       PROFILE -. "provides EC2 role credentials" .-> INSTANCE
     end
   end
 
-  OIDC -->|"token over HTTPS"| CREDENTIALS
+  TEST -->|"3. on main: pushes image over HTTPS 443"| IMAGE
+  OIDC -->|"5. exchanges token with AWS STS over HTTPS 443"| CREDENTIALS
   PROVIDER -. "issuer AWS validates" .-> CREDENTIALS
   GHROLE -. "trust checked before assumption" .-> CREDENTIALS
-  CREDENTIALS -->|"runner calls SSM API over HTTPS 443"| COMMAND
+  CREDENTIALS -->|"5. returns credentials to runner"| RUNNER
+  RUNNER -->|"6. calls SSM API over HTTPS 443"| COMMAND
   DEPLOYPOLICY -. "authorizes SendCommand and status reads" .-> COMMAND
-  SOFTWARE -->|"agent registers and polls outbound over HTTPS 443"| NODE
-  NODE -->|"SSM relays command to the agent"| SOFTWARE
-  RUNNER -->|"pushes images over HTTPS 443"| IMAGE
-  SOFTWARE -->|"Docker pulls versioned image over HTTPS 443"| IMAGE
+  COMMAND -->|"6. queues deployment command"| NODE
+  NODE -->|"7. SSM relays command to agent"| SOFTWARE
+  SOFTWARE -->|"8. Docker pulls versioned image over HTTPS 443"| IMAGE
+  SOFTWARE -->|"10. checks app after deployment"| HEALTH
+  CONTAINER -->|"serves HTTP response"| HEALTH
 ```
+
+Read the numbered arrows in order. Steps **1–5** happen on the GitHub side
+and at AWS STS; **6–8** pass the command through Systems Manager to the EC2
+agent and fetch the image; **9–10** replace the container and check that the
+app responds. The SSM agent registers the EC2 instance as a managed node
+during setup, before deployment. The IAM trust, policies, instance profile,
+and security group are supporting configuration: they authorize or enable
+these steps.
 
 **Where the SSM managed node comes from:** you do not create a managed node
 manually. Amazon Linux 2023 normally includes the SSM agent. Once
