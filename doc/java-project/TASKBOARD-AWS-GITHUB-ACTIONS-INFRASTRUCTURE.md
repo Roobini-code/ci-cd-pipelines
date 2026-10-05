@@ -291,6 +291,12 @@ authenticated GitHub role can do. It is not the role trust policy.
    with the EC2 Region, 12-digit AWS account ID, and exact EC2 instance ID.
 3. Create the policy named `TaskboardGitHubDeployPolicy`.
 
+After creating it, confirm `TaskboardGitHubDeployPolicy` appears under
+**IAM → Policies → Customer managed**, not under **IAM → Roles**. A policy
+defines permissions and is attached to a role; it is not itself a role. If
+this name appears under Roles instead, the wrong IAM resource was created.
+Create the policy here before continuing to Step 7.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -335,8 +341,10 @@ branch is `main`.
 3. If the wizard asks for **GitHub organization**, enter `Roobini-code`. Enter
    repository `java-project` and branch `main` if those fields are offered.
    Do not leave the repository/branch as wildcard `*`.
-4. Attach the existing `TaskboardGitHubDeployPolicy`. Do not paste the trust
-   policy into the permissions-policy editor.
+4. In the permissions step, attach the customer-managed policy
+   `TaskboardGitHubDeployPolicy` created in Step 6. Confirm you are selecting it
+   from **Policies**; do not select a role with the same name. Do not paste the
+   trust policy into the permissions-policy editor.
 5. Name the role `TaskboardGitHubActionsDeployRole` and create it.
 6. Open the role's **Trust relationships** and ensure it restricts assumption
    to this repository's `main` branch. The trust relationship should be:
@@ -367,7 +375,16 @@ branch is `main`.
    restricted policy above.
 7. In the role summary, copy the ARN. It has the form
    `arn:aws:iam::<ACCOUNT_ID>:role/TaskboardGitHubActionsDeployRole`; this
-   becomes the GitHub repository variable `AWS_ROLE_ARN`.
+   becomes the GitHub repository variable `AWS_ROLE_ARN`. Copy the **Role ARN**
+   from the role summary, not an instance profile ARN.
+
+**If you already created a role named `TaskboardGitHubDeployPolicy`:** IAM roles
+cannot be renamed, and that role does not replace the permissions policy from
+Step 6. Create the customer-managed policy if it is missing, then create the
+separate `TaskboardGitHubActionsDeployRole` above and attach that policy. Do
+not use the mistakenly named role's ARN for `AWS_ROLE_ARN`. Leave the mistaken
+role in place until the correctly named role is configured and deployment is
+verified; then, if it is unused, you can remove it from **IAM → Roles**.
 
 The workflow requests `id-token: write` only to obtain a short-lived OIDC
 token. It does not create or store AWS access keys. The AWS credentials
