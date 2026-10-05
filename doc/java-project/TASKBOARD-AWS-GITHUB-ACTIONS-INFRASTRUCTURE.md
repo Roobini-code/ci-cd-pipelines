@@ -28,7 +28,7 @@ and why this pipeline uses each one:
 | **Trust policy / trust relationship** | The “who may use this role?” rule attached to an IAM role. It is not the same as a permissions policy. | The GitHub role trusts only the GitHub OIDC identity for `Roobini-code/java-project` on `main`; the EC2 role trusts the EC2 service. |
 | **GitHub OIDC** | A way for GitHub Actions to prove its repository and branch identity to AWS using a short-lived signed token. | Lets the workflow assume its AWS role without storing permanent AWS access keys in GitHub. |
 | **OIDC identity provider** | AWS's registration of an external token issuer it is willing to validate. | Registers `token.actions.githubusercontent.com` so AWS can validate GitHub's token. It does not grant AWS permissions on its own. |
-| **AWS STS** | AWS Security Token Service; it issues temporary credentials after a role's trust rules are satisfied. | Exchanges the valid GitHub OIDC identity for short-lived credentials scoped to the GitHub deployment role. |
+| **AWS STS** | AWS Security Token Service; AWS provides and operates it automatically, so you do not create it. | The runner calls STS with its GitHub OIDC token. STS checks the IAM identity provider and role trust policy, then returns temporary credentials for the GitHub deployment role. |
 | **EC2 instance profile** | The attachment that makes an IAM role available to an EC2 instance. | Carries `TaskboardEC2SSMRole` to the EC2 machine so its SSM agent can authenticate to AWS. |
 | **Systems Manager (SSM)** | An AWS service for securely managing and running commands on registered servers. | Relays the deployment command to EC2 and returns its output/status to GitHub Actions. |
 | **SSM agent** | A background program installed and running on EC2. | Connects outbound to SSM over HTTPS, receives the deployment command, runs Docker commands locally, and reports the result. |
@@ -65,6 +65,10 @@ GitHub Actions. The role trust relationship restricts assumption to
 
 ## 2. Detailed architecture
 
+### Architecture image
+
+![AWS and GitHub Actions deployment architecture](AWS.png)
+
 ### 2.1 Who trusts whom, and which role has which permissions?
 
 Read this diagram from top to bottom. Solid arrows show a request or credential
@@ -73,21 +77,21 @@ connection.
 
 ```mermaid
 flowchart TB
-  APP["1. App workflow<br/>Roobini-code/java-project<br/>main branch"]
-  REUSABLE["2. Reusable workflow<br/>ci-cd-pipelines"]
-  RUNNER["3. GitHub-hosted runner"]
-  ISSUER["4. GitHub OIDC issuer<br/>token.actions.githubusercontent.com"]
-  TOKEN["5. Signed OIDC token<br/>sub = repo:Roobini-code/java-project:ref:refs/heads/main<br/>aud = sts.amazonaws.com"]
-  PROVIDER["6. AWS IAM OIDC provider<br/>registers GitHub as token issuer"]
-  TRUST["7. Role trust policy<br/>allows only this repo and main"]
-  ROLE["8. TaskboardGitHubActionsDeployRole"]
-  POLICY["9. TaskboardGitHubDeployPolicy<br/>SSM command access limited to target EC2"]
-  STS["10. AWS STS<br/>validates token and issues temporary credentials"]
-  SSM["11. AWS Systems Manager"]
-  EC2ROLE["12. TaskboardEC2SSMRole<br/>AmazonSSMManagedInstanceCore"]
-  INSTANCE["13. EC2 instance profile + taskboard-ec2"]
-  AGENT["14. SSM agent on EC2"]
-  APP_CONTAINER["15. Taskboard container<br/>taskboard-data Docker volume"]
+  APP["1. GitHub Actions workflow<br/>Roobini-code/java-project<br/>main branch"]
+  REUSABLE["2. GitHub Actions reusable workflow<br/>ci-cd-pipelines"]
+  RUNNER["3. GitHub-hosted Actions runner"]
+  ISSUER["4. GitHub Actions OIDC issuer<br/>token.actions.githubusercontent.com"]
+  TOKEN["5. GitHub OIDC signed token<br/>sub = repo:Roobini-code/java-project:ref:refs/heads/main<br/>aud = sts.amazonaws.com"]
+  PROVIDER["6. AWS IAM identity provider (OIDC)<br/>registers GitHub as token issuer"]
+  TRUST["7. AWS IAM role trust policy<br/>allows only this repo and main"]
+  ROLE["8. AWS IAM role<br/>TaskboardGitHubActionsDeployRole"]
+  POLICY["9. AWS IAM permissions policy<br/>TaskboardGitHubDeployPolicy<br/>SSM command access limited to target EC2"]
+  STS["10. AWS Security Token Service (STS)<br/>validates token and issues temporary credentials"]
+  SSM["11. AWS Systems Manager (SSM)<br/>Run Command service"]
+  EC2ROLE["12. AWS IAM EC2 instance role<br/>TaskboardEC2SSMRole<br/>AmazonSSMManagedInstanceCore policy"]
+  INSTANCE["13. EC2 instance profile and EC2 instance<br/>taskboard-ec2"]
+  AGENT["14. AWS Systems Manager Agent (SSM Agent)<br/>software running on EC2"]
+  APP_CONTAINER["15. Docker container on EC2<br/>Taskboard app + taskboard-data Docker volume"]
 
   APP -->|"calls"| REUSABLE
   REUSABLE -->|"starts job on"| RUNNER
@@ -118,57 +122,66 @@ interchangeable.
 
 ### 2.2 Numbered deployment flow: what runs, and where?
 
-Start at **1**. Follow the arrows. The PR path ends after CI; the `main` path
-continues through image publishing and deployment.
-
-```mermaid
-flowchart TD
-  START["1. Trigger<br/>PR to main OR push/merge to main"]
-  CHECKOUT["2. Runner checks out app<br/>GITHUB_TOKEN"]
-  TEST["3. Runner installs Java 21<br/>mvn clean verify"]
-  BUILD_CI["4. Runner builds Docker image locally"]
-  EVENT{"5. Is this a push to main?"}
-  PR_DONE["PR ends here<br/>Checks reported to GitHub<br/>No publish, AWS access, or deployment"]
-  VERSION["6. Runner derives unique image tag<br/>Maven version + run number/attempt"]
-  DOCKER_LOGIN["7. Runner logs in to Docker Hub<br/>using repository secrets"]
-  DOCKER_PUSH["8. Runner pushes versioned image + latest"]
-  OIDC["9. Runner requests GitHub OIDC token<br/>for this repository's main branch"]
-  STS["10. AWS STS validates OIDC claims<br/>and returns temporary role credentials"]
-  SEND["11. Runner calls SSM SendCommand<br/>for configured EC2 instance ID"]
-  AGENT_POLL["12. EC2 SSM agent receives command<br/>over its outbound HTTPS connection"]
-  PULL["13. EC2 pulls public versioned image<br/>from Docker Hub"]
-  REPLACE["14. EC2 replaces container<br/>reuses taskboard-data volume"]
-  HEALTH{"15. EC2 local HTTP health check passes?"}
-  ROLLBACK["Attempt to restore previous container<br/>Workflow fails; no Git tag"]
-  TAG["16. Runner creates and pushes<br/>matching Git tag"]
-  DONE["17. Deployment complete"]
-
-  START --> CHECKOUT --> TEST --> BUILD_CI --> EVENT
-  EVENT -->|"No: pull request"| PR_DONE
-  EVENT -->|"Yes: push/merge to main"| VERSION
-  VERSION --> DOCKER_LOGIN --> DOCKER_PUSH --> OIDC --> STS --> SEND
-  SEND --> AGENT_POLL --> PULL --> REPLACE --> HEALTH
-  HEALTH -->|"No"| ROLLBACK
-  HEALTH -->|"Yes"| TAG --> DONE
-```
+1. The runner checks out the app, runs tests, and builds the Docker image. A
+   pull request ends here without publishing or deployment.
+2. On a push or merge to `main`, the runner publishes the image to Docker Hub.
+3. The runner requests a GitHub OIDC token and exchanges it with AWS STS for
+   temporary credentials.
+4. The runner uses those credentials to ask Systems Manager to deploy to EC2.
+5. The EC2 SSM agent checks in outbound, receives the command, and reports its
+   result through Systems Manager.
+6. Docker on EC2 pulls the new image and replaces the Taskboard container,
+   keeping the `taskboard-data` volume.
+7. EC2 checks the app locally. On success, the workflow creates a Git tag; on
+   failure, it reports an error and attempts to restore the previous container.
 
 #### Which machine starts each connection?
 
 | Number | Connection/request | Initiated by | Direction and port |
 | ---: | --- | --- | --- |
-| 2 | App checkout | GitHub Actions runner | Runner → GitHub over HTTPS 443 using `GITHUB_TOKEN`. |
-| 7–8 | Docker login and image push | GitHub Actions runner | Runner → Docker Hub over HTTPS 443. |
-| 9–10 | OIDC token exchange / STS role assumption | GitHub Actions runner | Runner → GitHub OIDC and AWS STS over HTTPS 443. |
-| 11 | Send deployment command | GitHub Actions runner | Runner → AWS Systems Manager API over HTTPS 443 using temporary role credentials. |
-| 12 | SSM agent check-in / command retrieval | EC2 SSM agent | EC2 → AWS Systems Manager over outbound HTTPS 443. |
-| 13 | Pull deployment image | EC2 Docker Engine | EC2 → public Docker Hub over outbound HTTPS 443. |
-| 15 | Local app health check | EC2 deployment command | EC2 → `127.0.0.1:80`, inside the instance. |
+| 1 | App checkout | GitHub Actions runner | Runner → GitHub over HTTPS 443 using `GITHUB_TOKEN`. |
+| 2 | Image push | GitHub Actions runner | Runner → Docker Hub over HTTPS 443. |
+| 3 | OIDC token exchange and STS role assumption | GitHub Actions runner | Runner → GitHub OIDC and AWS STS over HTTPS 443. |
+| 4 | Send deployment command | GitHub Actions runner | Runner → AWS Systems Manager API over HTTPS 443 using temporary role credentials. |
+| 5 | SSM agent check-in / command retrieval | EC2 SSM agent | EC2 → AWS Systems Manager over outbound HTTPS 443. |
+| 6 | Pull deployment image | EC2 Docker Engine | EC2 → public Docker Hub over outbound HTTPS 443. |
+| 7 | Local app health check | EC2 deployment command | EC2 → `127.0.0.1:80`, inside the instance. |
 
 The runner does **not** create a network connection to EC2. Do not open EC2 SSH
 to GitHub or add GitHub runner IP ranges. The SSM agent on EC2 initiates its
 outbound HTTPS connection, and the Systems Manager service relays the command.
 The user's browser reaches the app separately on EC2 port 80, subject to the
 HTTP security-group rule.
+
+### 2.3 EC2 and SSM deployment details
+
+The architecture image above shows the AWS services, IAM resources, EC2
+components, and the GitHub Actions deployment path. The following details
+explain how the EC2 and SSM parts of that architecture work.
+
+**Where the SSM managed node comes from:** you do not create a managed node
+manually. Amazon Linux 2023 normally includes the SSM agent. Once
+`TaskboardEC2SSMRole` is attached to the instance and the agent is running, the
+agent uses that role to register with Systems Manager over outbound HTTPS.
+The instance then appears under **Systems Manager → Fleet Manager** or
+**Managed nodes** in the same Region, usually as **Online**. If the agent is
+not running, the role is missing, or outbound access is blocked, the instance
+will not appear online.
+
+**What is installed on EC2:** Docker Engine runs the Taskboard container, and
+`curl` is used for the local HTTP health check after deployment. The SSM agent
+receives and reports deployment commands. Java is packaged in the application
+image; it does not need to be installed separately on the EC2 host. The
+workflow uses the host's `taskboard-data` Docker volume to preserve the H2
+database when it replaces the container.
+
+**What the runner calls:** after tests pass on a push to `main`, the runner
+pushes the Docker image to Docker Hub, requests a GitHub OIDC token, and
+exchanges it with AWS STS for temporary credentials. It then calls the SSM
+`SendCommand` API and polls for the command result. It does not call EC2 over
+SSH. The SSM agent initiates its own outbound connection to Systems Manager,
+receives the command, pulls the image from Docker Hub, and runs the deployment
+script on the EC2 host.
 
 ## 3. AWS prerequisites
 
@@ -278,6 +291,12 @@ authenticated GitHub role can do. It is not the role trust policy.
    with the EC2 Region, 12-digit AWS account ID, and exact EC2 instance ID.
 3. Create the policy named `TaskboardGitHubDeployPolicy`.
 
+After creating it, confirm `TaskboardGitHubDeployPolicy` appears under
+**IAM → Policies → Customer managed**, not under **IAM → Roles**. A policy
+defines permissions and is attached to a role; it is not itself a role. If
+this name appears under Roles instead, the wrong IAM resource was created.
+Create the policy here before continuing to Step 7.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -322,8 +341,10 @@ branch is `main`.
 3. If the wizard asks for **GitHub organization**, enter `Roobini-code`. Enter
    repository `java-project` and branch `main` if those fields are offered.
    Do not leave the repository/branch as wildcard `*`.
-4. Attach the existing `TaskboardGitHubDeployPolicy`. Do not paste the trust
-   policy into the permissions-policy editor.
+4. In the permissions step, attach the customer-managed policy
+   `TaskboardGitHubDeployPolicy` created in Step 6. Confirm you are selecting it
+   from **Policies**; do not select a role with the same name. Do not paste the
+   trust policy into the permissions-policy editor.
 5. Name the role `TaskboardGitHubActionsDeployRole` and create it.
 6. Open the role's **Trust relationships** and ensure it restricts assumption
    to this repository's `main` branch. The trust relationship should be:
@@ -354,7 +375,16 @@ branch is `main`.
    restricted policy above.
 7. In the role summary, copy the ARN. It has the form
    `arn:aws:iam::<ACCOUNT_ID>:role/TaskboardGitHubActionsDeployRole`; this
-   becomes the GitHub repository variable `AWS_ROLE_ARN`.
+   becomes the GitHub repository variable `AWS_ROLE_ARN`. Copy the **Role ARN**
+   from the role summary, not an instance profile ARN.
+
+**If you already created a role named `TaskboardGitHubDeployPolicy`:** IAM roles
+cannot be renamed, and that role does not replace the permissions policy from
+Step 6. Create the customer-managed policy if it is missing, then create the
+separate `TaskboardGitHubActionsDeployRole` above and attach that policy. Do
+not use the mistakenly named role's ARN for `AWS_ROLE_ARN`. Leave the mistaken
+role in place until the correctly named role is configured and deployment is
+verified; then, if it is unused, you can remove it from **IAM → Roles**.
 
 The workflow requests `id-token: write` only to obtain a short-lived OIDC
 token. It does not create or store AWS access keys. The AWS credentials
