@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   verify:
-    name: Test and build image
+    name: CI
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,7 +51,7 @@ jobs:
         run: docker buildx build --load --tag taskboard:ci .
 
   publish-deploy:
-    name: Publish image and deploy to EC2
+    name: CD
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
