@@ -7,6 +7,24 @@ For a step-by-step AWS infrastructure, IAM/OIDC, Systems Manager, GitHub
 repository configuration, and deployment walkthrough, see
 [`doc/TASKBOARD-AWS-GITHUB-ACTIONS-INFRASTRUCTURE.md`](doc/TASKBOARD-AWS-GITHUB-ACTIONS-INFRASTRUCTURE.md).
 
+## React + Kubernetes
+
+- `/.github/workflows/k8s-app-deployment-ci.yml` runs the React tests,
+  production build, and a non-publishing container build for pull requests.
+- `/.github/workflows/k8s-app-deployment-cd.yml` tests and builds again after
+  merge, publishes an immutable commit-SHA-tagged image to Docker Hub, and
+  commits the updated image tag to the application repository's Kubernetes
+  Deployment manifest. Argo CD detects the Git change and syncs it to K3s.
+- The caller repository stores its small trigger workflows in
+  `k8s-app-deployment/.github/workflows/ci.yml` and `cd.yml`.
+- The example caller repository is
+  [`k8s-app-deployment`](https://github.com/OWNER/k8s-app-deployment). Replace
+  `OWNER` with the GitHub account or organization that owns both repositories.
+
+For the full React, Docker Hub, K3s-on-EC2, Argo CD, workflow setup, cost
+controls, and cleanup walkthrough, see
+[`k8s-app-deployment/doc/COMPLETE-HANDS-ON-GUIDE.md`](https://github.com/OWNER/k8s-app-deployment/blob/main/doc/COMPLETE-HANDS-ON-GUIDE.md).
+
 ## Taskboard Java
 
 `/.github/workflows/taskboard-java.yml` is called by
