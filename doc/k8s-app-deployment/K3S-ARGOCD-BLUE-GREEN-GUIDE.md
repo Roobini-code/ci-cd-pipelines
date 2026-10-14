@@ -13,11 +13,13 @@ flowchart LR
     Git[Git: blue/green manifests] -->|poll branch| Argo[Argo CD]
     Argo -->|sync wave 0| Blue[Blue Deployment]
     Argo -->|sync wave 0| Green[Green Deployment]
-    Argo -->|sync wave 1, after wave 0 healthy| Service[NodePort Service]
+    Argo -->|sync wave 1| Service[Internal ClusterIP Service]
+    Argo -->|sync wave 2| Ingress[Traefik Ingress + TLS]
+    Browser -->|HTTPS domain :443| Ingress
+    Ingress --> Service
     Service -->|selector chooses one slot| Active[Active app Pods]
     DH[Docker Hub] -->|pull exact SHA image| Blue
     DH -->|pull exact SHA image| Green
-    Browser -->|EC2 :30080| Service
     CD[GitHub Actions CD] -->|push image, update manifests in Git| Git
 ```
 
@@ -32,10 +34,19 @@ the Git change.
 The app repo's `k8s/base/kustomization.yaml` includes:
 
 - `namespace.yaml`: `k8s-demo`, sync wave `-1`.
+- `cluster-issuer.yaml`: Let's Encrypt ClusterIssuer, sync wave `-2`; requires
+  cert-manager CRDs/controller to be installed before the Application.
 - `deployment-blue.yaml` and `deployment-green.yaml`: one Pod each, sync wave
   `0`, and distinct `app.kubernetes.io/slot` labels.
-- `service.yaml`: one NodePort Service, sync wave `1`, initially selecting
-  blue and listening on NodePort `30080`.
+- `service.yaml`: internal `ClusterIP` Service, sync wave `1`, initially
+  selecting blue.
+- `ingress.yaml`: host-based Traefik ingress, sync wave `2`, requests TLS for
+  the configured domain using cert-manager.
+- `middleware.yaml`: redirects application HTTP requests to HTTPS.
+
+The host and issuer email in these manifests are intentional setup
+placeholders. Replace them with the domain and contact email you control
+before installing the Argo CD Application.
 
 Both Deployments use the same container security settings: non-root user,
 read-only root filesystem, dropped Linux capabilities, CPU/memory requests and
@@ -71,9 +82,12 @@ previous version after a successful switch.
 
 The ordering relies on Argo CD sync waves:
 
-1. Namespace at wave `-1`.
-2. Blue/green Deployments at wave `0`.
-3. Service at wave `1`.
+1. ClusterIssuer at wave `-2` (cert-manager must already be installed and its
+   CRDs established).
+2. Namespace at wave `-1`.
+3. Blue/green Deployments at wave `0`.
+4. Service and HTTPS redirect middleware at wave `1`.
+5. Ingress at wave `2`.
 
 Argo CD processes a higher wave after the lower wave's resources are Healthy.
 For the inactive Deployment, health depends on its rollout and the Pod passing
@@ -91,8 +105,11 @@ fails, both colors are unavailable.
 The broader AWS steps (instance sizing, budget alerts, instance role, security
 group, and Session Manager) are in the
 [complete app deployment guide](https://github.com/OWNER/k8s-app-deployment/blob/main/doc/COMPLETE-HANDS-ON-GUIDE.md).
-Use Session Manager rather than exposing SSH or the Kubernetes API to the
-internet.
+Follow that guide's sections 4.1-4.4 to create the budget alert, IAM role,
+security group, EC2 host, K3s, and Argo CD. For the public app, the target setup
+is a stable Elastic IP and a DNS A record; inbound TCP 80/443 is public web
+traffic, while NodePort 30080, Argo CD 30443, SSH, and the Kubernetes API stay
+closed. Administrative access uses Session Manager.
 
 On the Amazon Linux 2023 EC2 instance:
 
@@ -132,14 +149,33 @@ targetRevision: main
 path: k8s/base
 ```
 
-After the first CD release has replaced the placeholder image tags, apply the
-committed Application manifest on the EC2 host:
+Before applying the Application:
+
+1. Associate an Elastic IP with the EC2 instance and create a DNS A record for
+   the app hostname pointing to that address. Wait until DNS resolves correctly.
+2. Allow inbound TCP 80 and 443 in the instance security group; do not allow
+   the app NodePort or Argo CD UI from the internet.
+3. Install cert-manager from its official release manifest, pinning a release
+   compatible with the cluster. Wait for `cert-manager`, `cert-manager-webhook`,
+   and `cert-manager-cainjector` to become Available.
+4. In the app repository, replace both `app.example.com` host entries in
+   `k8s/base/ingress.yaml` with your DNS name and replace
+   `REPLACE-WITH-YOUR-EMAIL` in `k8s/base/cluster-issuer.yaml`. Commit and push
+   those manifest changes. They do not require rebuilding the app.
+5. Run the first CD release so both Deployments have a real image SHA.
+
+The [complete app hands-on guide](https://github.com/OWNER/k8s-app-deployment/blob/main/doc/COMPLETE-HANDS-ON-GUIDE.md)
+has the detailed AWS console clicks, DNS record fields, cert-manager install
+commands, and Session Manager UI tunnel.
+
+Apply the committed Application manifest on the EC2 host:
 
 ```bash
 sudo k3s kubectl apply \
   -f https://raw.githubusercontent.com/OWNER/k8s-app-deployment/main/argocd/application.yaml
 sudo k3s kubectl -n argocd get applications
 sudo k3s kubectl -n k8s-demo get deploy,pods,services
+sudo k3s kubectl -n k8s-demo get ingress,certificate
 ```
 
 The sample assumes the Git repo and Docker Hub image are public. For private
@@ -148,18 +184,22 @@ private Docker Hub repo, create a namespace-scoped `imagePullSecret` from a
 read-only token. Never put credentials into the `Application` or workload
 manifest.
 
-## Open the application
+## Stable public HTTPS endpoint
 
-The Service exposes HTTP on NodePort `30080`. Restrict inbound TCP `30080` in
-the EC2 security group to your current public IP. Do not expose it to
-`0.0.0.0/0` for real workloads.
+The application's Kubernetes Service is private (`ClusterIP`). K3s's bundled
+Traefik Ingress controller receives traffic on the EC2 host's ports 80 and 443.
+Open the configured hostname:
 
 ```text
-http://EC2-PUBLIC-IP:30080
+https://app.example.com
 ```
 
-This is plain HTTP for hands-on learning. Add TLS, DNS, and appropriate
-authentication before exposing a real application.
+Use your actual configured domain in place of `app.example.com`. cert-manager
+performs the Let's Encrypt HTTP-01 challenge over public port 80, creates the
+`deploylab-tls` Secret, and renews the certificate before expiry. HTTP requests
+are redirected to HTTPS. If issuance fails, inspect the Certificate,
+CertificateRequest, Order, and Challenge resources and verify DNS and inbound
+ports 80/443 before retrying.
 
 ## Observe deployments and switch state
 
@@ -169,6 +209,8 @@ Useful commands from Session Manager:
 sudo k3s kubectl -n argocd get application deploylab
 sudo k3s kubectl -n k8s-demo get deployments,pods,services -o wide
 sudo k3s kubectl -n k8s-demo get pods --show-labels
+sudo k3s kubectl -n k8s-demo get ingress,certificate
+sudo k3s kubectl -n cert-manager get certificaterequests,orders,challenges
 sudo k3s kubectl -n k8s-demo describe service deploylab
 sudo k3s kubectl -n k8s-demo describe deployment deploylab-blue
 sudo k3s kubectl -n k8s-demo describe deployment deploylab-green
@@ -197,6 +239,9 @@ reconciles the Service and Deployment manifests to the previous Git state.
 | Service has no endpoints | Compare Service slot selector with blue/green Pod labels; inspect readiness probes |
 | New color never becomes Healthy | Inspect the Deployment rollout, Pod events/logs, node memory/disk pressure, and `/healthz` |
 | Service switched before new app is ready | Confirm both Deployments have sync wave `0`, Service has wave `1`, and automatic sync is enabled |
+| Domain does not resolve | DNS A record points to the Elastic IP; remove incorrect AAAA record; allow time for propagation |
+| Certificate is not Ready | Confirm cert-manager components are available, DNS points to this EC2 host, and ports 80/443 are reachable; inspect cert-manager Challenge/Order events |
+| Ingress returns 404 | Request host matches the Ingress host; Traefik is running; app Service has ready endpoints |
 | Old version returns after a manual patch | Expected with Argo CD self-heal; change desired state in Git instead |
 
 ## Blue/green limitations
@@ -207,8 +252,9 @@ reconciles the Service and Deployment manifests to the previous Git state.
 - Keeping both colors running uses more cluster resources than a one-slot
   rolling update.
 - A single K3s node remains a single point of failure.
-- The example uses NodePort and plain HTTP; it does not include an Ingress
-  controller, TLS, traffic analysis, or automated post-switch rollback.
+- Public traffic uses an Elastic IP, DNS, Traefik, and automated HTTPS, but
+  the example does not include a managed load balancer, WAF, application
+  authentication, traffic analysis, or automated post-switch rollback.
 
 For additional AWS setup, billing/cost safeguards, GitHub secret configuration,
 pipeline troubleshooting, and resource teardown, continue with
